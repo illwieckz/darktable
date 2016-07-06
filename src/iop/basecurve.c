@@ -411,17 +411,6 @@ static inline void downsample(
     }
     if(ch == 4) buf0[ch*y+3] = 0.0f; // need that for normalisation weight later
   }
-// would need atomics
-// #ifdef _OPENMP
-// #pragma omp parallel for default(none) schedule(static) collapse(2)
-// #endif
-//   for(int j=0;j<ht1;j++) for(int i=0;i<wd1;i++)
-//   {
-//     const size_t x = wd1*j+i, y = wd0*(j/2) + i/2;
-//     for(int c=0;c<ch;c++)
-//       buf0[ch*y+c] += buf1[ch*x+c] * 0.25f;
-//     if(ch == 4) buf0[ch*y+3] = 0.0f; // need that for normalisation weight later
-//   }
 }
 
 static inline void compute_features(
@@ -441,7 +430,7 @@ static inline void compute_features(
     const size_t x = wd*j+i, y = ((wd+1)/2)*(j/2) + i/2;
     const float max = MAX(fine[4*x], MAX(fine[4*x+1], fine[4*x+2]));
     const float min = MIN(fine[4*x], MIN(fine[4*x+1], fine[4*x+2]));
-    const float sat = 1e-1f + (max-min)/max;
+    const float sat = 1e-1f + (max-min)/MAX(1e-4, max);
     float con = 1e-4f;
     for(int c=0;c<3;c++)
       con = MAX(con, fabsf(fine[4*x+c] - coarse[4*y+c]));
@@ -451,6 +440,7 @@ static inline void compute_features(
     v = MAX(fabsf(fine[4*x+2]-0.5f), v);
     float exp = MAX(0.2, 0.25f-v*v);
     feat[x] = exp * con * sat;
+    assert(feat[x] == feat[x]);
   }
 }
 
@@ -479,9 +469,6 @@ void process(struct dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, const 
       col[k]  = dt_alloc_align(64, sizeof(float)*4*wd*ht);
       feat[k] = dt_alloc_align(64, sizeof(float)*wd*ht);
       comb[k] = dt_alloc_align(64, sizeof(float)*4*wd*ht);
-      assert(col[k]);
-      assert(feat[k]);
-      assert(comb[k]);
       memset(comb[k], 0, sizeof(float)*4*wd*ht);
       wd = (wd+1)/2; ht = (ht+1)/2;
       if(wd < 2 || ht < 2)
@@ -553,7 +540,7 @@ void process(struct dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, const 
 #endif
       for(size_t i=0;i<(size_t)wd*ht;i++)
         if(comb[k][4*i+3] > 1e-5f)
-        for(int c=0;c<3;c++) comb[k][4*i+c] /= comb[k][4*i+3];
+          for(int c=0;c<3;c++) comb[k][4*i+c] /= comb[k][4*i+3];
       // reconstruct output image
       if(k < num_buf-1)
       {

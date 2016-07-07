@@ -373,6 +373,7 @@ static inline void apply_ev_and_curve(
   }
 }
 
+#if 0
 static inline void downsample(
     float *const buf0,
     const float *const buf1,
@@ -412,11 +413,97 @@ static inline void downsample(
     if(ch == 4) buf0[ch*y+3] = 0.0f; // need that for normalisation weight later
   }
 }
+#endif
+
+#define X(N) x[o + (N)*s]
+// 1d cdf 9/7 wavelet transform given array with offset o, stride s and cnt elements
+static inline void cdf_97(float *x, int o, int s, int cnt)
+{
+  const float a = -1.58613432;
+  const float b = -0.05298011854;
+  const float d =  0.8829110762;
+  const float g =  0.4435068522;
+  const float k =  1.149604398;
+
+  for(int i=1;i+1<cnt;i+=2) X(i) += a * (X(i+1) + X(i-1));   X(cnt-1) += 2*a*X(cnt-2);
+  for(int i=2;i+1<cnt;i+=2) X(i) += b * (X(i+1) + X(i-1));   X(0)     += 2*b*X(1);
+  for(int i=1;i+1<cnt;i+=2) X(i) += d * (X(i+1) + X(i-1));   X(cnt-1) += 2*d*X(cnt-2);
+  for(int i=2;i+1<cnt;i+=2) X(i) += g * (X(i+1) + X(i-1));   X(0)     += 2*g*X(1);
+  for(int i=0;i  <cnt;i+=2) X(i) *= k;
+  for(int i=1;i  <cnt;i+=2) X(i) /= k;
+}
+
+// corresponding inverse transform
+static inline void icdf_97(float *x, int o, int s, int cnt)
+{
+  const float a =  1.58613432;
+  const float b =  0.05298011854;
+  const float d = -0.8829110762;
+  const float g = -0.4435068522;
+  const float k =  1.149604398;
+
+  for(int i=1;i  <cnt;i+=2) X(i) *= k;
+  for(int i=0;i  <cnt;i+=2) X(i) /= k;
+  for(int i=2;i+1<cnt;i+=2) X(i) += g * (X(i+1) + X(i-1));   X(0)     += 2*g*X(1);
+  for(int i=1;i+1<cnt;i+=2) X(i) += d * (X(i+1) + X(i-1));   X(cnt-1) += 2*d*X(cnt-2);
+  for(int i=2;i+1<cnt;i+=2) X(i) += b * (X(i+1) + X(i-1));   X(0)     += 2*b*X(1);
+  for(int i=1;i+1<cnt;i+=2) X(i) += a * (X(i+1) + X(i-1));   X(cnt-1) += 2*a*X(cnt-2);
+}
+#undef X
+
+// perform a 2d cdf 9/7 wavelet transform on 3d+1 colour data strided 4
+static inline void wtf_cdf_97(
+    float *const buf,
+    const int wd,
+    const int ht,
+    const int cc,
+    const int num_levels)
+{
+  for(int level=0;level<num_levels;level++)
+  {
+    const int s = 1<<level; // 1, 2, 4
+    for(int c=0;c<cc;c++)
+    {
+#ifdef _OPENMP
+#pragma omp parallel for default(none) shared(c) schedule(static)
+#endif
+      for(int x=0;x<wd;x+=s) cdf_97(buf, c + 4*x   , 4*wd*s, (ht-1)/s+1);
+#ifdef _OPENMP
+#pragma omp parallel for default(none) shared(c) schedule(static)
+#endif
+      for(int y=0;y<ht;y+=s) cdf_97(buf, c + 4*wd*y,    4*s, (wd-1)/s+1);
+    }
+  }
+}
+
+// perform a 2d cdf 9/7 inverse wavelet transform on 3d+1 colour data strided 4
+static inline void iwtf_cdf_97(
+    float *const buf,
+    const int wd,
+    const int ht,
+    const int cc,
+    const int num_levels)
+{
+  // inverse transform
+  for(int level=num_levels-1;level>=0;level--)
+  {
+    const int s = 1<<level; // 1, 2, 4
+    for(int c=0;c<cc;c++)
+    {
+#ifdef _OPENMP
+#pragma omp parallel for default(none) shared(c) schedule(static)
+#endif
+      for(int y=0;y<ht;y+=s) icdf_97(buf, c + 4*wd*y,    4*s, (wd-1)/s+1);
+#ifdef _OPENMP
+#pragma omp parallel for default(none) shared(c) schedule(static)
+#endif
+      for(int x=0;x<wd;x+=s) icdf_97(buf, c + 4*x   , 4*wd*s, (ht-1)/s+1);
+    }
+  }
+}
 
 static inline void compute_features(
-    float *feat,
-    const float *const fine,
-    const float *const coarse,
+    float *const col,
     int wd,
     int ht)
 {
@@ -424,30 +511,27 @@ static inline void compute_features(
   // 1) well exposedness
   // 2) saturation
   // 3) local contrast
-  for(int j=0;j<ht;j++)
-  for(int i=0;i<wd;i++)
+  for(int j=0;j<ht;j++) for(int i=0;i<wd;i++)
   {
-    const size_t x = wd*j+i, y = ((wd+1)/2)*(j/2) + i/2;
-    const float max = MAX(fine[4*x], MAX(fine[4*x+1], fine[4*x+2]));
-    const float min = MIN(fine[4*x], MIN(fine[4*x+1], fine[4*x+2]));
+    const size_t x = 4*(wd*j+i);
+    const float max = MAX(col[x], MAX(col[x+1], col[x+2]));
+    const float min = MIN(col[x], MIN(col[x+1], col[x+2]));
     const float sat = 1e-1f + (max-min)/MAX(1e-4, max);
-    float con = 1e-4f;
-    for(int c=0;c<3;c++)
-      con = MAX(con, fabsf(fine[4*x+c] - coarse[4*y+c]));
 
-    float v = fabsf(fine[4*x]-0.5f);
-    v = MAX(fabsf(fine[4*x+1]-0.5f), v);
-    v = MAX(fabsf(fine[4*x+2]-0.5f), v);
-    float exp = MAX(0.2, 0.25f-v*v);
-    feat[x] = exp * con * sat;
-    assert(feat[x] == feat[x]);
+    float v = fabsf(col[x]-0.5f);
+    v = MAX(fabsf(col[x+1]-0.5f), v);
+    v = MAX(fabsf(col[x+2]-0.5f), v);
+    const float exp = MAX(0.2, 0.25f-v*v);
+
+    const float con = (col[x+1] + col[x+2] + col[x+3])*0.333f;
+    col[x+3] = exp * sat * con;
   }
 }
 
 void process(struct dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, const void *const i, void *const o,
              const dt_iop_roi_t *const roi_in, const dt_iop_roi_t *const roi_out)
 {
-  float *const in  = (float *)i;
+  const float *const in  = (float *)i;
   float *const out = (float *)o;
   const int ch = piece->colors;
   dt_iop_basecurve_data_t *const d = (dt_iop_basecurve_data_t *)(piece->data);
@@ -455,132 +539,97 @@ void process(struct dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, const 
   // are we doing exposure fusion?
   if(d->exposure_fusion)
   {
-    // will need a few extra buffers/gaussian pyramids.
-    // one for the pushed image's colour buffer,
-    // one for the pushed image's feature buffer,
-    // one for the output.
-    int num_buf = 7; // max number of levels
-    float **col  = malloc(num_buf * sizeof(float*));
-    float **feat = malloc(num_buf * sizeof(float*));
-    float **comb = malloc(num_buf * sizeof(float*));
-    int wd = roi_in->width, ht = roi_in->height;
-    for(int k=0;k<num_buf;k++)
-    {
-      col[k]  = dt_alloc_align(64, sizeof(float)*4*wd*ht);
-      feat[k] = dt_alloc_align(64, sizeof(float)*wd*ht);
-      comb[k] = dt_alloc_align(64, sizeof(float)*4*wd*ht);
-      memset(comb[k], 0, sizeof(float)*4*wd*ht);
-      wd = (wd+1)/2; ht = (ht+1)/2;
-      if(wd < 2 || ht < 2)
+    // allocate temporary buffer for wavelet transform + blending
+    const int wd = roi_in->width, ht = roi_in->height;
+    int num_levels = 7; // max number of wavelet transform levels
+    float *col = dt_alloc_align(64, sizeof(float)*4*wd*ht);
+    memset(out, 0, sizeof(float)*4*wd*ht);
+    { // determine max wavelet scales:
+      int w = wd, h = ht;
+      for(int k=0;k<num_levels;k++)
       {
-        num_buf = k+1;
-        break;
+        w = (w+1)/2; h = (h+1)/2;
+        if(w < 2 || h < 2)
+        {
+          num_levels = k+1;
+          break;
+        }
       }
     }
 
-    float mul = 1.0f;
-    for(int e=0;e<d->exposure_fusion+1;e++)
+    // XXX for(int e=0;e<d->exposure_fusion+1;e++)
+    for(int e=0;e<1;e++)
     { // for every exposure fusion image:
       // push by some ev, apply base curve:
       apply_ev_and_curve(
-          in, col[0], roi_in->width, roi_in->height,
-          mul, d->table, d->unbounded_coeffs);
-      mul *= powf(2.0f, d->exposure_stops);
+          in, col, roi_in->width, roi_in->height,
+          powf(2.0f, d->exposure_stops * e),
+          d->table, d->unbounded_coeffs);
 
-      // create gaussian pyramid of colour buffer
-      wd = roi_in->width; ht = roi_in->height;
-      for(int k=1;k<num_buf;k++)
-      {
-        downsample(col[k], col[k-1], wd, ht, 4);
-        wd = (wd+1)/2; ht = (ht+1)/2;
-      }
-      // compute features
-      compute_features(feat[0], col[0], col[1], roi_in->width, roi_in->height);
+#if 0
+      // compute features, destroys buffer
+      wtf_cdf_97(col, wd, ht, 3, 1);
+      for(int j=0;j<ht;j+=2) for(int i=0;i<wd;i+=2)
+        for(int c=0;c<3;c++)
+          col[4*(wd*j+i)+c] = 0.0f;   // kill coarse coeffs
+      iwtf_cdf_97(col, wd, ht, 3, 1); // reconstruct
+      compute_features(col, wd, ht);
 
-      // compute gaussian pyramid of features
-      wd = roi_in->width; ht = roi_in->height;
-      for(int k=1;k<num_buf;k++)
-      {
-        downsample(feat[k], feat[k-1], wd, ht, 1);
-        wd = (wd+1)/2; ht = (ht+1)/2;
-      }
-
-      // accumulate to combined output pyramid coarse to fine:
-      for(int k=num_buf-1;k>=0;k--)
-      {
-        wd = roi_in->width; ht = roi_in->height;
-        for(int i=0;i<k;i++) { wd = (wd+1)/2; ht = (ht+1)/2;}
-#ifdef _OPENMP
-#pragma omp parallel for default(none) shared(ht, wd, k, e, num_buf, comb, feat, col) schedule(static) collapse(2)
+      // start over:
+      apply_ev_and_curve(
+          in, col, roi_in->width, roi_in->height,
+          powf(2.0f, d->exposure_stops * e),
+          d->table, d->unbounded_coeffs);
 #endif
-        for(int j=0;j<ht;j++) for(int i=0;i<wd;i++)
-        {
-          const size_t x = wd*j+i, y = ((wd+1)/2)*(j/2) + i/2;
-          // blend images into output pyramid
-          if(k==num_buf-1) // gaussian base
-            for(int c=0;c<3;c++) comb[k][4*x+c] += feat[k][x] * col[k][4*x+c];
-          else // laplacian
-            for(int c=0;c<3;c++) comb[k][4*x+c] +=
-              feat[k][x] * (col[k][4*x+c] - col[k+1][4*y+c]);
-          // accum weight, too
-          comb[k][4*x+3] += feat[k][x];
-          // XXX visualise feature weights:
-          // if(k == 0) out[4*x+e] = feat[0][x];
-        }
+
+      // XXX fake features
+      for(int k=0;k<wd*ht;k++)
+        col[4*k+3] = 1.0f;
+
+      // wavelet transform colour buffer:
+      wtf_cdf_97(col, wd, ht, 4, num_levels);
+
+      // accumulate wavelet transformed version:
+#ifdef _OPENMP
+#pragma omp parallel for default(none) shared(col) schedule(static)
+#endif
+      for(int k=0;k<wd*ht;k++)
+      {
+        for(int c=0;c<3;c++)
+          out[4*k+c] += col[4*k+c];// XXX  * col[4*k+3];
+        out[4*k+3] = 1;// XXX += col[4*k+3];
       }
     }
-#if 1
-    // normalise output pyramid buffer
-    for(int k=num_buf-1;k>=0;k--)
-    {
-      wd = roi_in->width; ht = roi_in->height;
-      for(int i=0;i<k;i++) { wd = (wd+1)/2; ht = (ht+1)/2;}
+#if 0
+    // normalise output buffer
 #ifdef _OPENMP
-#pragma omp parallel for default(none) shared(k, wd, ht, comb) schedule(static)
+#pragma omp parallel for default(none) schedule(static)
 #endif
-      for(size_t i=0;i<(size_t)wd*ht;i++)
-        if(comb[k][4*i+3] > 1e-5f)
-          for(int c=0;c<3;c++) comb[k][4*i+c] /= comb[k][4*i+3];
-      // reconstruct output image
-      if(k < num_buf-1)
-      {
+    for(int k=0;k<wd*ht;k++)
+      for(int c=0;c<3;c++)
+        out[4*k+c] /= out[4*k+3];
+#endif
+
+    iwtf_cdf_97(out, wd, ht, 4, num_levels);
+
 #ifdef _OPENMP
-#pragma omp parallel for default(none) shared(k, wd, ht, col, comb, feat) schedule(static) collapse(2)
+#pragma omp parallel for default(none) schedule(static)
 #endif
-        for(int j=0;j<ht;j++) for(int i=0;i<wd;i++)
-        {
-          const size_t x = wd*j+i, y = ((wd+1)/2)*(j/2) + i/2;
-          // XXX
-          // for(int c=0;c<3;c++) comb[k][4*x+c] = 0.0;
-          for(int c=0;c<3;c++) comb[k][4*x+c] += comb[k+1][4*y+c];
-          if(k == 0)
-          { // copy to output buffer, pass on 4th channel:
-            for(int c=0;c<3;c++) out[4*x+c] = comb[k][4*x+c];
-            out[4*x+3] = in[4*x+3];
-          }
-        }
-      }
-    }
-#endif
-    // free temp buffers
-    for(int k=0;k<num_buf;k++)
-    {
-      free(col[k]);
-      free(feat[k]);
-      free(comb[k]);
-    }
+    for(int k=0;k<wd*ht;k++)
+      out[4*k+3] = in[4*k+3]; // pass on 4th channel
+
+    // free temp buffer
     free(col);
-    free(feat);
-    free(comb);
     return;
   }
 
+  // fast path for non-fusion
 #ifdef _OPENMP
 #pragma omp parallel for default(none) schedule(static)
 #endif
   for(size_t k = 0; k < (size_t)roi_out->width * roi_out->height; k++)
   {
-    float *inp = in + ch * k;
+    const float *inp = in + ch * k;
     float *outp = out + ch * k;
     for(int i = 0; i < 3; i++)
     {

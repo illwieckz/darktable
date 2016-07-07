@@ -449,6 +449,24 @@ static inline void icdf_97(float *x, int o, int s, int cnt)
 }
 #undef X
 
+static inline void wtf_cdf_97_single(
+    float *const buf,
+    const int wd,
+    const int ht,
+    const int c,
+    const int level)
+{
+  const int s = 1<<level; // 1, 2, 4
+#ifdef _OPENMP
+#pragma omp parallel for default(none) schedule(static)
+#endif
+  for(int x=0;x<wd;x+=s) cdf_97(buf, c + 4*x   , 4*wd*s, (ht-1)/s+1);
+#ifdef _OPENMP
+#pragma omp parallel for default(none) schedule(static)
+#endif
+  for(int y=0;y<ht;y+=s) cdf_97(buf, c + 4*wd*y,    4*s, (wd-1)/s+1);
+}
+
 // perform a 2d cdf 9/7 wavelet transform on 3d+1 colour data strided 4
 static inline void wtf_cdf_97(
     float *const buf,
@@ -458,20 +476,8 @@ static inline void wtf_cdf_97(
     const int num_levels)
 {
   for(int level=0;level<num_levels;level++)
-  {
-    const int s = 1<<level; // 1, 2, 4
     for(int c=0;c<cc;c++)
-    {
-#ifdef _OPENMP
-#pragma omp parallel for default(none) shared(c) schedule(static)
-#endif
-      for(int x=0;x<wd;x+=s) cdf_97(buf, c + 4*x   , 4*wd*s, (ht-1)/s+1);
-#ifdef _OPENMP
-#pragma omp parallel for default(none) shared(c) schedule(static)
-#endif
-      for(int y=0;y<ht;y+=s) cdf_97(buf, c + 4*wd*y,    4*s, (wd-1)/s+1);
-    }
-  }
+      wtf_cdf_97_single(buf, wd, ht, c, level);
 }
 
 // perform a 2d cdf 9/7 inverse wavelet transform on 3d+1 colour data strided 4
@@ -557,7 +563,7 @@ void process(struct dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, const 
   {
     // allocate temporary buffer for wavelet transform + blending
     const int wd = roi_in->width, ht = roi_in->height;
-    int num_levels = 6; // max number of wavelet transform levels
+    int num_levels = 8; // max number of wavelet transform levels
     float *col = dt_alloc_align(64, sizeof(float)*4*wd*ht);
     memset(out, 0, sizeof(float)*4*wd*ht);
     { // determine max wavelet scales:
@@ -573,8 +579,7 @@ void process(struct dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, const 
       }
     }
 
-    // XXX for(int e=0;e<d->exposure_fusion+1;e++)
-    for(int e=1;e<2;e++)
+    for(int e=0;e<d->exposure_fusion+1;e++)
     { // for every exposure fusion image:
       // push by some ev, apply base curve:
       apply_ev_and_curve(
@@ -594,8 +599,8 @@ void process(struct dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, const 
 #if 0
       // XXX DEBUG: visualise feature buffer
       for(int k=0;k<wd*ht;k++)
-        for(int c=0;c<3;c++)
-          out[4*k+c] = col[4*k+3];
+        out[4*k+e] = col[4*k+3];
+      if(e<d->exposure_fusion) continue;
       free(col);
       return;
 #endif
@@ -606,23 +611,25 @@ void process(struct dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, const 
           powf(2.0f, d->exposure_stops * e),
           d->table, d->unbounded_coeffs);
 
-      // TODO: wavelet transform 3 colour channels
-      // TODO: then accum weighted detail with untouched (coarse) 4th channel (feature buffer)
-      // TODO: then wavelet transform 4th channel
-      // TODO: iterate on coarser scales
 
-      // wavelet transform colour buffer:
-      wtf_cdf_97(col, wd, ht, 3, num_levels);
-
-      // accumulate wavelet transformed version:
-#ifdef _OPENMP
-#pragma omp parallel for default(none) shared(col) schedule(static)
-#endif
-      for(int k=0;k<wd*ht;k++)
+      for(int level=0;level<num_levels;level++)
       {
+        // wavelet transform 3 colour channels
         for(int c=0;c<3;c++)
-          out[4*k+c] += col[4*k+c];// XXX  * col[4*k+3];
-        out[4*k+3] = 1;// XXX += col[4*k+3];
+          wtf_cdf_97_single(col, wd, ht, c, level);
+        // accum weighted detail with untouched (coarse) 4th channel (feature buffer)
+        const int s = 1<<level;
+        for(int x=0;x<wd;x+=s) for(int y=0;y<ht;y+=s)
+        {
+          if(level==num_levels-1 || (x & s) || (y & s))
+          { // copy over detail coeffs and coarse only the last time around
+            for(int c=0;c<3;c++)
+              out[4*(y*wd+x)+c] += col[4*(y*wd+x)+c] * col[4*(y*wd+x)+3];
+            out[4*(y*wd+x)+3] += col[4*(y*wd+x)+3];
+          }
+        }
+        // then wavelet transform 4th channel (features)
+        wtf_cdf_97_single(col, wd, ht, 3, level);
       }
     }
     // normalise output buffer
@@ -633,6 +640,7 @@ void process(struct dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, const 
       for(int c=0;c<3;c++)
         out[4*k+c] /= out[4*k+3];
 
+    // inverse wavelet transform
     iwtf_cdf_97(out, wd, ht, 3, num_levels);
 
 #ifdef _OPENMP

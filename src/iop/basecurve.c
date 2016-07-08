@@ -523,14 +523,16 @@ static inline void compute_features1(
     const size_t x = 4*(wd*j+i);
     const float max = MAX(col[x], MAX(col[x+1], col[x+2]));
     const float min = MIN(col[x], MIN(col[x+1], col[x+2]));
-    const float sat = 1e-1f + (max-min)/MAX(1e-4, max);
+    const float sat = .5f + 4.0f*(max-min)/MAX(1e-4, max);
+    col[x+3] = sat;
 
+#if 0 // doesn't do any good it seems :/
     float v = fabsf(col[x]-0.5f);
     v = MAX(fabsf(col[x+1]-0.5f), v);
     v = MAX(fabsf(col[x+2]-0.5f), v);
-    const float exp = MAX(0.2, 0.25f-v*v);
-
-    col[x+3] = exp * sat;
+    const float exp = MAX(1., 0.25f-v*v);
+    col[x+3] *= exp;
+#endif
   }
 }
 
@@ -545,7 +547,7 @@ static inline void compute_features2(
   for(int j=0;j<ht;j++) for(int i=0;i<wd;i++)
   {
     const size_t x = 4*(wd*j+i);
-    const float con = (col[x+0] + col[x+1] + col[x+2])*0.333f;
+    const float con = MAX(1e-3f, col[x+0]*col[x+0] + col[x+1]*col[x+1] + col[x+2]*col[x+2]);
     col[x+3] *= con;
   }
 }
@@ -563,7 +565,9 @@ void process(struct dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, const 
   {
     // allocate temporary buffer for wavelet transform + blending
     const int wd = roi_in->width, ht = roi_in->height;
-    int num_levels = 8; // max number of wavelet transform levels
+    // TODO: should probably be adjusted such that the
+    // TODO: coarsest step is some % of image width.
+    int num_levels = 3; // max number of wavelet transform levels
     float *col = dt_alloc_align(64, sizeof(float)*4*wd*ht);
     memset(out, 0, sizeof(float)*4*wd*ht);
     { // determine max wavelet scales:
@@ -589,6 +593,7 @@ void process(struct dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, const 
 
       // compute features, destroys buffer
       compute_features1(col, wd, ht);
+#if 0
       wtf_cdf_97(col, wd, ht, 3, 1);
       for(int j=0;j<ht;j+=2) for(int i=0;i<wd;i+=2)
         for(int c=0;c<3;c++)
@@ -610,7 +615,7 @@ void process(struct dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, const 
           in, col, roi_in->width, roi_in->height,
           powf(2.0f, d->exposure_stops * e),
           d->table, d->unbounded_coeffs);
-
+#endif
 
       for(int level=0;level<num_levels;level++)
       {
@@ -621,11 +626,23 @@ void process(struct dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, const 
         const int s = 1<<level;
         for(int x=0;x<wd;x+=s) for(int y=0;y<ht;y+=s)
         {
-          if(level==num_levels-1 || (x & s) || (y & s))
-          { // copy over detail coeffs and coarse only the last time around
+          if(level==num_levels-1 && !((x & s) || (y & s)))
+          { // and coarse only the last time around
+            const float w = MAX(1e-4f, col[4*(y*wd+x)+3]);
             for(int c=0;c<3;c++)
-              out[4*(y*wd+x)+c] += col[4*(y*wd+x)+c] * col[4*(y*wd+x)+3];
-            out[4*(y*wd+x)+3] += col[4*(y*wd+x)+3];
+              out[4*(y*wd+x)+c] += col[4*(y*wd+x)+c] * w;
+            out[4*(y*wd+x)+3] += w;
+          }
+          if((x & s) || (y & s))
+          { // copy over detail coeffs blended by magnitude
+            const float w = MAX(1e-4f,
+                col[4*(y*wd+x)+0]*col[4*(y*wd+x)+0]+
+                col[4*(y*wd+x)+1]*col[4*(y*wd+x)+1]+
+                col[4*(y*wd+x)+2]*col[4*(y*wd+x)+2]+
+                col[4*(y*wd+x)+3]); // XXX w should be the common coarse coeff i guess?
+            for(int c=0;c<3;c++)
+              out[4*(y*wd+x)+c] += col[4*(y*wd+x)+c] * w;
+            out[4*(y*wd+x)+3] += w;
           }
         }
         // then wavelet transform 4th channel (features)
@@ -1238,7 +1255,7 @@ void gui_init(struct dt_iop_module_t *self)
   dt_bauhaus_combobox_add(c->fusion, _("none"));
   dt_bauhaus_combobox_add(c->fusion, _("0ev, +3ev"));
   dt_bauhaus_combobox_add(c->fusion, _("0ev, +3ev, +6ev"));
-  gtk_widget_set_tooltip_text(c->fusion, _("fuse this image stopped up a couple of times with itself, to compress high dynamic range"));
+  gtk_widget_set_tooltip_text(c->fusion, _("fuse this image stopped up a couple of times with itself, to compress high dynamic range. expose for the highlights before use."));
   gtk_box_pack_start(GTK_BOX(self->widget), c->fusion, TRUE, TRUE, 0);
   g_signal_connect(G_OBJECT(c->fusion), "value-changed", G_CALLBACK(fusion_callback), self);
 
